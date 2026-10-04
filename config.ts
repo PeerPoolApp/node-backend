@@ -1,3 +1,9 @@
+/**
+ * Process env for the Fastify API (local, Vercel, Coolify/Docker).
+ * Production SPA origin is always CORS-merged; bind HOST=0.0.0.0 in containers.
+ * See context/implemented/coolify-hetzner-backend.md.
+ */
+
 function required(name: string): string {
   const value = process.env[name]
   if (!value) throw new Error(`Missing env: ${name}`)
@@ -25,9 +31,12 @@ const LOCAL_VITE_LOOPBACK = LOCAL_VITE_ORIGINS.map((o) =>
   o.replace('://localhost', '://127.0.0.1'),
 )
 
+/** Production SPA on Cloudflare. Always merged so a stale Coolify CORS_ORIGIN still works. */
+const PRODUCTION_WEB_ORIGINS = ['https://app.peerpool.at']
+
 /**
- * Parse CORS_ORIGIN (comma-separated) and always merge local Vite + Capacitor origins.
- * A stale CORS_ORIGIN (e.g. 5173–5175 only) must not block admin on 5176.
+ * Parse CORS_ORIGIN (comma-separated) and always merge local Vite + Capacitor + production web.
+ * A stale CORS_ORIGIN (e.g. 5173–5175 only) must not block admin on 5176 or the public SPA.
  */
 function resolveCorsOrigin(): boolean | string | string[] {
   const raw = process.env.CORS_ORIGIN ?? LOCAL_VITE_ORIGINS.join(',')
@@ -41,6 +50,7 @@ function resolveCorsOrigin(): boolean | string | string[] {
       ...LOCAL_VITE_ORIGINS,
       ...LOCAL_VITE_LOOPBACK,
       ...CAPACITOR_ORIGINS,
+      ...PRODUCTION_WEB_ORIGINS,
     ]),
   ]
   return merged.length === 1 ? merged[0]! : merged
