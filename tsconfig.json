@@ -1,5 +1,6 @@
 { 
   // Visit https://aka.ms/tsconfig to read more about this file
+  "exclude": ["tests", "vitest.config.ts", "node_modules", "dist"],
   "compilerOptions": {
     // File Layout — emit to dist/ so tsc does not create index.js next to index.ts
     "rootDir": ".",

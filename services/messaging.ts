@@ -87,6 +87,7 @@ export type ConversationPreviewMessage = {
   created_at: string
   sender_id: string
   deleted_at: string | null
+  edited_at: string | null
   moderation_hidden_at: string | null
 }
 
@@ -94,9 +95,9 @@ const LAST_MESSAGE_PAGE = 1000
 const LAST_MESSAGE_PER_CONV = 20
 
 const MESSAGE_PREVIEW_SELECT =
-  'id, conversation_id, body, created_at, sender_id, deleted_at, moderation_hidden_at'
+  'id, conversation_id, body, created_at, sender_id, deleted_at, edited_at, moderation_hidden_at'
 const MESSAGE_PREVIEW_SELECT_LEGACY =
-  'id, conversation_id, body, created_at, sender_id, deleted_at'
+  'id, conversation_id, body, created_at, sender_id, deleted_at, edited_at'
 
 /** False after the connected DB is shown to lack `messages.moderation_hidden_at`. */
 let messagesHaveModerationHidden = true
@@ -149,8 +150,10 @@ export async function lastVisibleMessagesByConversationIds(
     supabaseAdmin
       .from('messages')
       .select(previewSelect())
+      .eq('delivery_ready', true)
       .in('conversation_id', conversationIds)
       .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
       .limit(LAST_MESSAGE_PAGE)
 
   let { data: recent, error } = await runPage()
@@ -179,8 +182,10 @@ export async function lastVisibleMessagesByConversationIds(
         supabaseAdmin
           .from('messages')
           .select(previewSelect())
+      .eq('delivery_ready', true)
           .eq('conversation_id', id)
           .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
           .limit(LAST_MESSAGE_PER_CONV)
       let { data, error: followErr } = await runFollow()
       if (shouldRetryWithoutModerationHidden(followErr)) {

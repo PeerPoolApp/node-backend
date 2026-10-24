@@ -1497,7 +1497,7 @@ export async function eventRoutes(app: FastifyInstance) {
         return reply.code(500).send({ error: 'Event created but invites failed' })
       }
       const name = await organizerName(request.userId)
-      void notifyUsers(
+      await notifyUsers(
         friendIds,
         eventInviteNotification({
           organizerName: name,
@@ -1535,7 +1535,7 @@ export async function eventRoutes(app: FastifyInstance) {
           return reply.code(500).send({ error: 'Event created but community invites failed' })
         }
         const name = await organizerName(request.userId)
-        void notifyUsers(
+        await notifyUsers(
           memberIds,
           eventInviteNotification({
             organizerName: name,
@@ -1577,7 +1577,7 @@ export async function eventRoutes(app: FastifyInstance) {
           return reply.code(500).send({ error: 'Event created but channel invites failed' })
         }
         const name = await organizerName(request.userId)
-        void notifyUsers(
+        await notifyUsers(
           memberIds,
           eventInviteNotification({
             organizerName: name,
@@ -1815,7 +1815,7 @@ export async function eventRoutes(app: FastifyInstance) {
           request.log.error(invErr)
         } else {
           const name = await organizerName(request.userId)
-          void notifyUsers(
+          await notifyUsers(
             inviteIds,
             eventInviteNotification({
               organizerName: name,
@@ -2229,7 +2229,7 @@ export async function eventRoutes(app: FastifyInstance) {
         .eq('id', request.userId)
         .maybeSingle()
 
-      void notifyUsers(
+      await notifyUsers(
         [profile.id],
         eventInviteNotification({
           organizerName: me?.full_name || me?.username || 'Someone',
@@ -2610,7 +2610,7 @@ export async function eventRoutes(app: FastifyInstance) {
         }
         const userIds = (members ?? []).map((m) => m.user_id as string)
         const name = await organizerName(request.userId)
-        void notifyUsers(
+        await notifyUsers(
           userIds,
           eventNoticeNotification({
             organizerName: name,
@@ -2650,7 +2650,7 @@ export async function eventRoutes(app: FastifyInstance) {
               eventTitle: ev.title,
               eventId: ev.id,
             })
-      void notifyUsers(userIds, payload, { log: request.log, excludeUserId: request.userId })
+      await notifyUsers(userIds, payload, { log: request.log, excludeUserId: request.userId })
       return { ok: true, count: userIds.length }
     },
   )

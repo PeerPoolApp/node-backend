@@ -338,7 +338,7 @@ export async function friendRoutes(app: FastifyInstance) {
         .eq('id', request.userId)
         .maybeSingle()
 
-      void notifyUsers(
+      await notifyUsers(
         [userId],
         friendRequestNotification({
           requesterName: requester?.full_name ?? 'Someone',

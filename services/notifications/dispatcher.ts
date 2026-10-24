@@ -20,7 +20,7 @@ export async function notifyUsers(
   payload: NotificationPayload,
   opts?: { excludeUserId?: string; log?: Logger },
 ): Promise<void> {
-  const targets = userIds.filter((id) => id !== opts?.excludeUserId)
+  const targets = [...new Set(userIds)].filter((id) => id !== opts?.excludeUserId)
   if (targets.length === 0) return
 
   if (payload.kind !== 'message') {
@@ -48,7 +48,13 @@ export async function notifyUsers(
       } catch (e) {
         opts?.log?.warn(e)
         const status = (e as { statusCode?: number })?.statusCode
-        if (status === 404 || status === 410) {
+        const code = (e as { code?: string })?.code
+        if (
+          status === 404 ||
+          status === 410 ||
+          code === 'messaging/registration-token-not-registered' ||
+          code === 'messaging/invalid-registration-token'
+        ) {
           await supabaseAdmin.from('push_devices').delete().eq('id', device.id)
         }
       }

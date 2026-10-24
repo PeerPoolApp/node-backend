@@ -21,6 +21,7 @@ import { jobRoutes, startTagPropagationInterval } from './routes/jobs.js'
 import { accountRoutes } from './routes/account.js'
 import { reportRoutes } from './routes/reports.js'
 import { adminRoutes } from './routes/admin.js'
+import { forwardHttpRequest } from './lib/forwardHttpRequest.js'
 
 const app = Fastify({ logger: true })
 
@@ -64,7 +65,7 @@ export default async function handler(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
-  app.server.emit('request', req, res)
+  await forwardHttpRequest(app.server, req, res)
 }
 
 // Local / Railway-style only — Vercel sets VERCEL and uses the handler export

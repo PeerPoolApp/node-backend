@@ -6,6 +6,7 @@
  * See `.cursor/rules/messaging.mdc`.
  */
 
+import { unreadStates } from '../services/messageState.js'
 import type { FastifyInstance } from 'fastify'
 import { randomUUID } from 'node:crypto'
 import { requireAuth } from '../middleware/auth.js'
@@ -117,12 +118,13 @@ async function notifyMessageRecipients(
   },
 ) {
   try {
-    const { data: members } = await supabaseAdmin
+    const { data: members, error: memberError } = await supabaseAdmin
       .from('conversation_members')
       .select('user_id')
       .eq('conversation_id', conversationId)
       .neq('user_id', senderId)
 
+    if (memberError) throw memberError
     const recipientIds = (members ?? []).map((m) => m.user_id)
     if (recipientIds.length === 0) return
 
@@ -144,7 +146,7 @@ async function notifyMessageRecipients(
       communityId = undefined
     }
 
-    void notifyUsers(
+    await notifyUsers(
       recipientIds,
       messageNotification({
         senderName,
@@ -287,37 +289,8 @@ export async function messageRoutes(app: FastifyInstance) {
       (err, ctx) => request.log.warn({ err }, ctx),
     )
 
-    const { data: recentMessages, error: recentErr } = await supabaseAdmin
-      .from('messages')
-      .select('id, conversation_id, body, created_at, sender_id, deleted_at, moderation_hidden_at')
-      .in('conversation_id', conversationIds)
-      .order('created_at', { ascending: false })
-      .limit(1000)
-    if (recentErr) {
-      request.log.warn({ err: recentErr }, 'recent messages for unread')
-    }
-
-    const hideSets = await messageHideSets(request.userId)
-    const unreadByConv = new Map<string, number>()
-    const lastReadByConv = new Map(
-      items.map((i) => [i.conversation_id, i.last_read_at as string | null]),
-    )
-    for (const msg of recentMessages ?? []) {
-      if (
-        !messageAllowedForViewer(msg, request.userId, hideSets.personal, hideSets.global)
-      ) {
-        continue
-      }
-      if (msg.deleted_at) continue
-      if (msg.sender_id === request.userId) continue
-      const lastRead = lastReadByConv.get(msg.conversation_id)
-      if (!lastRead || msg.created_at > lastRead) {
-        unreadByConv.set(
-          msg.conversation_id,
-          (unreadByConv.get(msg.conversation_id) ?? 0) + 1,
-        )
-      }
-    }
+    const counts = await unreadStates(request.userId, conversationIds)
+    const unreadByConv = new Map(counts.map((row) => [row.conversation_id, row.unread_count]))
 
     const avatarPaths: Array<string | null> = []
     for (const x of members ?? []) {
@@ -459,6 +432,8 @@ export async function messageRoutes(app: FastifyInstance) {
         members: people,
         lastMessage: last
           ? {
+              id: last.id,
+              edited_at: last.edited_at,
               body: last.deleted_at ? null : last.body,
               created_at: last.created_at,
               sender_id: last.sender_id,
@@ -670,7 +645,9 @@ export async function messageRoutes(app: FastifyInstance) {
         .from('messages')
         .select(messageThreadSelect())
         .eq('conversation_id', conversationId)
-        .order('created_at', { ascending: false })
+        .eq('delivery_ready', true)
+.order('created_at', { ascending: false })
+        .order('id', { ascending: false })
         .limit(limit)
       if (request.query.before) {
         q = q.lt('created_at', request.query.before)
@@ -756,6 +733,29 @@ export async function messageRoutes(app: FastifyInstance) {
     }
 
     return messages.reverse()
+  })
+
+  /** Canonical hydration for push/Realtime signals. Never trust notification previews as content. */
+  app.get<{ Params: { id: string; messageId: string } }>(
+    '/conversations/:id/messages/:messageId', { preHandler: requireAuth }, async (request, reply) => {
+      const { id, messageId } = request.params
+      if (!(await assertMember(id, request.userId))) return reply.code(403).send({ error: 'Not a member' })
+      const { data, error } = await supabaseAdmin.from('messages')
+        .select('id, conversation_id, sender_id, body, client_id, created_at, edited_at, deleted_at, reply_to_id, moderation_hidden_at, message_attachments ( id, storage_path, mime_type, size_bytes, file_name )')
+        .eq('conversation_id', id).eq('id', messageId).eq('delivery_ready', true).maybeSingle()
+      if (error) throw error
+      const hides = await messageHideSets(request.userId)
+      if (!data || !messageAllowedForViewer(data, request.userId, hides.personal, hides.global)) {
+        return reply.code(404).send({ error: 'Message not available' })
+      }
+      return withSignedAttachments(data, request.log)
+    },
+  )
+
+  /** Session-wide summary, independent of list pagination/search. */
+  app.get('/conversations/unread', { preHandler: requireAuth }, async (request) => {
+    const counts = await unreadStates(request.userId)
+    return { counts, total: counts.reduce((n, row) => n + (row.include_in_main ? row.unread_count : 0), 0) }
   })
 
   /**
@@ -864,6 +864,16 @@ export async function messageRoutes(app: FastifyInstance) {
         }
       }
 
+      // Retry lookup precedes Storage validation: successful image sends remove their original upload.
+      const { data: existing, error: existingError } = await supabaseAdmin.from('messages')
+        .select('id, conversation_id, sender_id, body, client_id, created_at, edited_at, deleted_at, reply_to_id, message_attachments ( id, storage_path, mime_type, size_bytes, file_name )')
+        .eq('sender_id', request.userId).eq('client_id', clientId).maybeSingle()
+      if (existingError) throw existingError
+      if (existing) {
+        if (existing.conversation_id !== conversationId) return reply.code(400).send({ error: 'Client ID belongs to another conversation' })
+        return withSignedAttachments(existing, request.log)
+      }
+
       for (const att of attachments) {
         const validationError = validateAttachmentMeta({
           mimeType: att.mimeType,
@@ -894,85 +904,27 @@ export async function messageRoutes(app: FastifyInstance) {
         }
       }
 
-      const { data: existing } = await supabaseAdmin
-        .from('messages')
-        .select(
-          'id, conversation_id, sender_id, body, client_id, created_at, edited_at, deleted_at, reply_to_id, message_attachments ( id, storage_path, mime_type, size_bytes, file_name )',
-        )
-        .eq('sender_id', request.userId)
-        .eq('client_id', clientId)
-        .maybeSingle()
-
-      if (existing) {
-        return existing
+      // Finish CPU/storage work before inserting a message; recipients never see a partial row.
+      const processed: AttachmentInput[] = []
+      try {
+        for (const attachment of attachments) processed.push(await reencodeChatImageAttachment(attachment))
+      } catch (error) {
+        request.log.error(error)
+        return reply.code(500).send({ error: 'Could not process image' })
       }
-
-      const { data: message, error: insertError } = await supabaseAdmin
-        .from('messages')
-        .insert({
-          conversation_id: conversationId,
-          sender_id: request.userId,
-          body,
-          client_id: clientId,
-          reply_to_id: replyToId ?? null,
-        })
-        .select('id, conversation_id, sender_id, body, client_id, created_at, edited_at, deleted_at, reply_to_id')
-        .single()
-
-      if (insertError || !message) {
-        request.log.error(insertError)
-        return reply.code(500).send({ error: 'Could not send message' })
+      const { data, error } = await supabaseAdmin.rpc('commit_chat_message', {
+        conversation: conversationId, sender: request.userId, client: clientId,
+        content: body, reply_to: replyToId ?? null, attachment_rows: processed,
+      })
+      if (error || !data?.[0]?.message) {
+        request.log.error(error)
+        return reply.code(error?.code === '22023' ? 400 : 500).send({ error: 'Could not send message' })
       }
-
-      if (attachments.length > 0) {
-        const processed: AttachmentInput[] = []
-        try {
-          for (const a of attachments) {
-            processed.push(await reencodeChatImageAttachment(a))
-          }
-        } catch (e) {
-          request.log.error(e)
-          await supabaseAdmin.from('messages').delete().eq('id', message.id)
-          return reply.code(500).send({ error: 'Could not process image' })
-        }
-
-        const { error: attError } = await supabaseAdmin.from('message_attachments').insert(
-          processed.map((a) => ({
-            message_id: message.id,
-            storage_path: a.storagePath,
-            mime_type: a.mimeType,
-            size_bytes: a.sizeBytes,
-            file_name: a.fileName,
-          })),
-        )
-        if (attError) {
-          request.log.error(attError)
-          await supabaseAdmin.from('messages').delete().eq('id', message.id)
-          return reply.code(500).send({ error: 'Could not save attachments' })
-        }
+      const full = data[0].message as {
+        id: string; body: string | null; created_at: string; message_attachments: NonNullable<MessageWithAttachments['message_attachments']>
       }
-
-      await supabaseAdmin
-        .from('conversations')
-        .update({ updated_at: new Date().toISOString() })
-        .eq('id', conversationId)
-
-      const { data: full, error: loadError } = await supabaseAdmin
-        .from('messages')
-        .select(
-          'id, conversation_id, sender_id, body, client_id, created_at, edited_at, deleted_at, reply_to_id, message_attachments ( id, storage_path, mime_type, size_bytes, file_name )',
-        )
-        .eq('id', message.id)
-        .single()
-
-      if (loadError || !full) {
-        void notifyMessageRecipients(request, conversationId, request.userId, message)
-        return reply.code(201).send(message)
-      }
-
-      void notifyMessageRecipients(request, conversationId, request.userId, full)
-      // Signed download URLs so the sender UI can resolve attachments without a refetch
-      return reply.code(201).send(await withSignedAttachments(full, request.log))
+      if (data[0].inserted) await notifyMessageRecipients(request, conversationId, request.userId, full)
+      return reply.code(data[0].inserted ? 201 : 200).send(await withSignedAttachments(full, request.log))
     },
   )
 
@@ -1038,7 +990,7 @@ export async function messageRoutes(app: FastifyInstance) {
           .update({ body, edited_at: new Date().toISOString() })
           .eq('id', message.id)
           .select(
-            'id, conversation_id, sender_id, body, client_id, created_at, edited_at, deleted_at, reply_to_id, message_attachments ( id, storage_path, mime_type, size_bytes, file_name )',
+            'id, conversation_id, sender_id, body, client_id, created_at, edited_at, deleted_at, reply_to_id, delivery_ready, message_attachments ( id, storage_path, mime_type, size_bytes, file_name )',
           )
           .single()
 
@@ -1116,11 +1068,11 @@ export async function messageRoutes(app: FastifyInstance) {
    * POST `/conversations/:id/read` — update read cursor for current user.
    *
    * @auth Bearer required + conversation membership
-   * @body messageId (optional) — upsert into `message_reads`
+   * @body messageId (required) — displayed message watermark
    * @returns 200 `{ lastReadAt }`
    * @errors 401; 403 not member; 500 member update failed
    * @pre `assertMember` passes
-   * @post Updates `conversation_members.last_read_at`; optional `message_reads` upsert
+   * @post Atomically advances the membership timestamp + message ID, never backwards
    */
   app.post<{ Params: { id: string }; Body: ReadBody }>(
     '/conversations/:id/read',
@@ -1131,33 +1083,15 @@ export async function messageRoutes(app: FastifyInstance) {
         return reply.code(403).send({ error: 'Not a member of this conversation' })
       }
 
-      const now = new Date().toISOString()
-      const { error: memberError } = await supabaseAdmin
-        .from('conversation_members')
-        .update({ last_read_at: now })
-        .eq('conversation_id', conversationId)
-        .eq('user_id', request.userId)
+      const messageId = request.body?.messageId
+      if (!messageId) return reply.code(400).send({ error: 'messageId is required' })
+      const { data, error } = await supabaseAdmin.rpc('mark_conversation_read', {
+        viewer: request.userId, conversation: conversationId, message: messageId,
+      })
+      if (error) return reply.code(error.code === '22023' ? 400 : error.code === '42501' ? 403 : 500)
+        .send({ error: 'Could not update read state' })
+      return { lastReadAt: data?.[0]?.last_read_at, lastReadMessageId: data?.[0]?.last_read_message_id }
 
-      if (memberError) {
-        request.log.error(memberError)
-        return reply.code(500).send({ error: 'Could not update read state' })
-      }
-
-      if (request.body?.messageId) {
-        const { error: readError } = await supabaseAdmin.from('message_reads').upsert(
-          {
-            message_id: request.body.messageId,
-            user_id: request.userId,
-            seen_at: now,
-          },
-          { onConflict: 'message_id,user_id' },
-        )
-        if (readError) {
-          request.log.error(readError)
-        }
-      }
-
-      return { lastReadAt: now }
     },
   )
 }

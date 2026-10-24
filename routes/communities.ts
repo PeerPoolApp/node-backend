@@ -5,6 +5,7 @@
  * Channels: `services/communityChannels.ts` (Phase 3).
  */
 
+import { unreadStates } from '../services/messageState.js'
 import type { FastifyInstance } from 'fastify'
 import { requireAuth } from '../middleware/auth.js'
 import { supabaseAdmin } from '../services/supabase.js'
@@ -1090,7 +1091,7 @@ export async function communityRoutes(app: FastifyInstance) {
         .eq('id', request.userId)
         .maybeSingle()
 
-      void notifyUsers(
+      await notifyUsers(
         [targetId],
         communityInviteNotification({
           inviterName: inviter?.full_name ?? 'Someone',
@@ -1418,35 +1419,8 @@ export async function communityRoutes(app: FastifyInstance) {
       (err, ctx) => request.log.warn({ err }, ctx),
     )
 
-    const { data: recentMessages, error: recentErr } = await supabaseAdmin
-      .from('messages')
-      .select('id, conversation_id, body, created_at, sender_id, deleted_at, moderation_hidden_at')
-      .in('conversation_id', conversationIds)
-      .order('created_at', { ascending: false })
-      .limit(1000)
-    if (recentErr) {
-      request.log.warn({ err: recentErr }, 'recent messages for unread')
-    }
-
-    const hideSets = await messageHideSets(request.userId)
-    const unreadByConv = new Map<string, number>()
-    const lastReadByConv = new Map(filtered.map((i) => [i.conversation_id, i.last_read_at]))
-    for (const msg of recentMessages ?? []) {
-      if (
-        !messageAllowedForViewer(msg, request.userId, hideSets.personal, hideSets.global)
-      ) {
-        continue
-      }
-      if (msg.deleted_at) continue
-      if (msg.sender_id === request.userId) continue
-      const lastRead = lastReadByConv.get(msg.conversation_id)
-      if (!lastRead || msg.created_at > lastRead) {
-        unreadByConv.set(
-          msg.conversation_id,
-          (unreadByConv.get(msg.conversation_id) ?? 0) + 1,
-        )
-      }
-    }
+    const counts = await unreadStates(request.userId, conversationIds)
+    const unreadByConv = new Map(counts.map((row) => [row.conversation_id, row.unread_count]))
 
     const results = filtered.map((i) => {
       const last = lastByConv.get(i.conversation_id)
@@ -1464,6 +1438,8 @@ export async function communityRoutes(app: FastifyInstance) {
         unreadCount: unreadByConv.get(i.conversation_id) ?? 0,
         lastMessage: last
           ? {
+              id: last.id,
+              edited_at: last.edited_at,
               body: last.deleted_at ? null : last.body,
               created_at: last.created_at,
               sender_id: last.sender_id,
