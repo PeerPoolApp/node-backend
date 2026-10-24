@@ -2,13 +2,18 @@
  * User search + suggest (profiles). All reads via supabaseAdmin; no public profile listing.
  */
 
+import { collectionResponse } from '../lib/collectionResponse.js'
 import type { FastifyInstance } from 'fastify'
 import { requireAuth } from '../middleware/auth.js'
 import { supabaseAdmin } from '../services/supabase.js'
 import { avatarUrlsForPaths } from '../services/avatars.js'
 import { visibleTagsForUser, visibleTagsForUsers } from '../services/userHashtags.js'
 import { TEXT_LIMITS, exceedsLimit } from '../lib/textLimits.js'
-import { hiddenIdsFor, isMissingRelationOrColumn, userAllowedForViewer } from '../services/moderation.js'
+import {
+  hiddenIdsFor,
+  isMissingRelationOrColumn,
+  userAllowedForViewer,
+} from '../services/moderation.js'
 
 type ProfileRow = {
   id: string
@@ -22,10 +27,7 @@ type ProfileRow = {
   app_role?: string | null
 }
 
-async function friendshipMapFor(
-  userId: string,
-  ids: string[],
-): Promise<Map<string, string>> {
+async function friendshipMapFor(userId: string, ids: string[]): Promise<Map<string, string>> {
   const friendshipMap = new Map<string, string>()
   if (ids.length === 0) return friendshipMap
   const { data: requests } = await supabaseAdmin
@@ -80,7 +82,7 @@ async function toUserDtos(userId: string, page: ProfileRow[]) {
     id: p.id,
     username: p.username,
     full_name: p.full_name,
-    avatarUrl: p.avatar_storage_path ? urlMap.get(p.avatar_storage_path) ?? null : null,
+    avatarUrl: p.avatar_storage_path ? (urlMap.get(p.avatar_storage_path) ?? null) : null,
     avatarUpdatedAt: p.avatar_updated_at ?? null,
     friendshipStatus: friendshipMap.get(p.id) ?? 'none',
     tags: tagsMap.get(p.id) ?? [],
@@ -98,7 +100,9 @@ export async function userRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const raw = (request.query.q ?? '').trim().replace(/^@+/, '')
       if (exceedsLimit(raw, TEXT_LIMITS.search)) {
-        return reply.code(400).send({ error: `Query must be at most ${TEXT_LIMITS.search} characters` })
+        return reply.code(400).send({
+          error: `Query must be at most ${TEXT_LIMITS.search} characters`,
+        })
       }
 
       let query = supabaseAdmin
@@ -161,7 +165,9 @@ export async function userRoutes(app: FastifyInstance) {
         return reply.code(400).send({ error: 'Query must be at least 2 characters' })
       }
       if (exceedsLimit(q, TEXT_LIMITS.search)) {
-        return reply.code(400).send({ error: `Query must be at most ${TEXT_LIMITS.search} characters` })
+        return reply.code(400).send({
+          error: `Query must be at most ${TEXT_LIMITS.search} characters`,
+        })
       }
 
       const safe = q.replace(/[%_\\]/g, '')
@@ -205,12 +211,15 @@ export async function userRoutes(app: FastifyInstance) {
         if (await userAllowedForViewer(p.id, request.userId, p, hides)) allowed.push(p)
       }
       const nextCursor =
-        (profiles ?? []).length > limit ? page[page.length - 1]?.username ?? null : null
+        (profiles ?? []).length > limit ? (page[page.length - 1]?.username ?? null) : null
 
-      return {
-        users: await toUserDtos(request.userId, allowed),
+      return collectionResponse(
+        request,
+        reply,
+        'users',
+        await toUserDtos(request.userId, allowed),
         nextCursor,
-      }
+      )
     },
   )
 
@@ -226,7 +235,9 @@ export async function userRoutes(app: FastifyInstance) {
 
       const { data: profile, error } = await supabaseAdmin
         .from('profiles')
-        .select('id, username, full_name, birthday, avatar_storage_path, avatar_updated_at, app_role')
+        .select(
+          'id, username, full_name, birthday, avatar_storage_path, avatar_updated_at, app_role',
+        )
         .eq('id', targetId)
         .maybeSingle()
 
@@ -250,9 +261,7 @@ export async function userRoutes(app: FastifyInstance) {
           username: row.username,
           full_name: row.full_name,
           birthday: row.birthday ?? null,
-          avatarUrl: row.avatar_storage_path
-            ? urlMap.get(row.avatar_storage_path) ?? null
-            : null,
+          avatarUrl: row.avatar_storage_path ? (urlMap.get(row.avatar_storage_path) ?? null) : null,
           avatarUpdatedAt: row.avatar_updated_at ?? null,
           friendshipStatus: friendship.status,
           friendRequestId: friendship.requestId,
@@ -265,83 +274,82 @@ export async function userRoutes(app: FastifyInstance) {
   /**
    * GET /users/:id/shared-communities — communities both users have joined.
    */
-  app.get<{ Params: { id: string }; Querystring: { limit?: string; cursor?: string } }>(
-    '/users/:id/shared-communities',
-    { preHandler: requireAuth },
-    async (request, reply) => {
-      const targetId = request.params.id
-      const limit = Math.min(Number(request.query.limit ?? 20) || 20, 50)
-      const cursor = request.query.cursor?.trim()
+  app.get<{
+    Params: { id: string }
+    Querystring: { limit?: string; cursor?: string }
+  }>('/users/:id/shared-communities', { preHandler: requireAuth }, async (request, reply) => {
+    const targetId = request.params.id
+    const limit = Math.min(Number(request.query.limit ?? 20) || 20, 50)
+    const cursor = request.query.cursor?.trim()
 
-      const { data: myRows, error: myErr } = await supabaseAdmin
-        .from('community_members')
-        .select('community_id')
-        .eq('user_id', request.userId)
-        .eq('status', 'joined')
+    const { data: myRows, error: myErr } = await supabaseAdmin
+      .from('community_members')
+      .select('community_id')
+      .eq('user_id', request.userId)
+      .eq('status', 'joined')
 
-      if (myErr) {
-        request.log.error(myErr)
-        return reply.code(500).send({ error: 'Could not load communities' })
-      }
+    if (myErr) {
+      request.log.error(myErr)
+      return reply.code(500).send({ error: 'Could not load communities' })
+    }
 
-      const myIds = (myRows ?? []).map((r) => r.community_id as string)
-      if (myIds.length === 0) return { communities: [], nextCursor: null }
+    const myIds = (myRows ?? []).map((r) => r.community_id as string)
+    if (myIds.length === 0) return { communities: [], nextCursor: null }
 
-      const { data: theirRows, error: theirErr } = await supabaseAdmin
-        .from('community_members')
-        .select('community_id')
-        .eq('user_id', targetId)
-        .eq('status', 'joined')
-        .in('community_id', myIds)
+    const { data: theirRows, error: theirErr } = await supabaseAdmin
+      .from('community_members')
+      .select('community_id')
+      .eq('user_id', targetId)
+      .eq('status', 'joined')
+      .in('community_id', myIds)
 
-      if (theirErr) {
-        request.log.error(theirErr)
-        return reply.code(500).send({ error: 'Could not load communities' })
-      }
+    if (theirErr) {
+      request.log.error(theirErr)
+      return reply.code(500).send({ error: 'Could not load communities' })
+    }
 
-      const sharedIds = (theirRows ?? []).map((r) => r.community_id as string)
-      if (sharedIds.length === 0) return { communities: [], nextCursor: null }
+    const sharedIds = (theirRows ?? []).map((r) => r.community_id as string)
+    if (sharedIds.length === 0) return { communities: [], nextCursor: null }
 
-      let query = supabaseAdmin
-        .from('communities')
-        .select('id, name, identifier, avatar_storage_path, avatar_updated_at')
-        .in('id', sharedIds)
-        .order('identifier', { ascending: true })
-        .limit(limit + 1)
+    let query = supabaseAdmin
+      .from('communities')
+      .select('id, name, identifier, avatar_storage_path, avatar_updated_at')
+      .in('id', sharedIds)
+      .order('identifier', { ascending: true })
+      .limit(limit + 1)
 
-      if (cursor) {
-        query = query.gt('identifier', cursor)
-      }
+    if (cursor) {
+      query = query.gt('identifier', cursor)
+    }
 
-      const { data: communities, error: commErr } = await query
-      if (commErr) {
-        request.log.error(commErr)
-        return reply.code(500).send({ error: 'Could not load communities' })
-      }
+    const { data: communities, error: commErr } = await query
+    if (commErr) {
+      request.log.error(commErr)
+      return reply.code(500).send({ error: 'Could not load communities' })
+    }
 
-      type CommRow = {
-        id: string
-        name: string
-        identifier: string
-        avatar_storage_path: string | null
-        avatar_updated_at: string | null
-      }
+    type CommRow = {
+      id: string
+      name: string
+      identifier: string
+      avatar_storage_path: string | null
+      avatar_updated_at: string | null
+    }
 
-      const page = ((communities ?? []) as CommRow[]).slice(0, limit)
-      const nextCursor =
-        (communities ?? []).length > limit ? page[page.length - 1]?.identifier ?? null : null
-      const urlMap = await avatarUrlsForPaths(page.map((c) => c.avatar_storage_path))
+    const page = ((communities ?? []) as CommRow[]).slice(0, limit)
+    const nextCursor =
+      (communities ?? []).length > limit ? (page[page.length - 1]?.identifier ?? null) : null
+    const urlMap = await avatarUrlsForPaths(page.map((c) => c.avatar_storage_path))
 
-      return {
-        communities: page.map((c) => ({
-          id: c.id,
-          name: c.name,
-          identifier: c.identifier,
-          avatarUrl: c.avatar_storage_path ? urlMap.get(c.avatar_storage_path) ?? null : null,
-          avatarUpdatedAt: c.avatar_updated_at ?? null,
-        })),
-        nextCursor,
-      }
-    },
-  )
+    return {
+      communities: page.map((c) => ({
+        id: c.id,
+        name: c.name,
+        identifier: c.identifier,
+        avatarUrl: c.avatar_storage_path ? (urlMap.get(c.avatar_storage_path) ?? null) : null,
+        avatarUpdatedAt: c.avatar_updated_at ?? null,
+      })),
+      nextCursor,
+    }
+  })
 }

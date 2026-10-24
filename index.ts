@@ -31,7 +31,14 @@ await app.register(helmet, {
 await app.register(cors, {
   origin: config.corsOrigin,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-job-secret'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'x-job-secret',
+    'If-None-Match',
+    'x-peerpool-revisions',
+  ],
+  exposedHeaders: ['ETag'],
 })
 await app.register(multipart, { limits: { fileSize: 2 * 1024 * 1024 } })
 
@@ -61,10 +68,7 @@ await app.ready()
 stopTagInterval = startTagPropagationInterval(app.log)
 
 /** Vercel Node.js serverless entry — bridges req/res into Fastify. */
-export default async function handler(
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> {
+export default async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
   await forwardHttpRequest(app.server, req, res)
 }
 

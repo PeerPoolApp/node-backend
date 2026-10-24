@@ -2,6 +2,11 @@
  * Friend request routes: request, accept, decline, unfriend, invite links.
  */
 
+import {
+  collectionResponse,
+  encodePageCursor,
+  decodePageCursor,
+} from '../lib/collectionResponse.js'
 import type { FastifyInstance } from 'fastify'
 import { requireAuth } from '../middleware/auth.js'
 import { supabaseAdmin } from '../services/supabase.js'
@@ -20,10 +25,18 @@ import {
 import { isAdminUser, isMissingRelationOrColumn } from '../services/moderation.js'
 import { visibleTagsForUsers, type UserTagDto } from '../services/userHashtags.js'
 
-const PROFILE_PUBLIC =
-  'id, username, full_name, avatar_storage_path, avatar_updated_at'
+const PROFILE_PUBLIC = 'id, username, full_name, avatar_storage_path, avatar_updated_at'
 
 type RequestBody = { userId?: string }
+/** Base request columns are identical with or without the optional joined search profile. */
+type FriendRequestRecord = {
+  id: string
+  requester_id: string
+  addressee_id: string
+  status: string
+  created_at: string
+  responded_at: string | null
+}
 
 async function loadPublicProfilesByIds(ids: string[]) {
   if (ids.length === 0) {
@@ -43,14 +56,16 @@ async function loadPublicProfilesByIds(ids: string[]) {
     const fallback = await supabaseAdmin.from('profiles').select(PROFILE_PUBLIC).in('id', ids)
     return fallback.data ?? []
   }
-  return ((withRole.data ?? []) as Array<{
-    id: string
-    username: string
-    full_name: string
-    avatar_storage_path?: string | null
-    avatar_updated_at?: string | null
-    app_role?: string | null
-  }>).filter((p) => p.app_role !== 'admin')
+  return (
+    (withRole.data ?? []) as Array<{
+      id: string
+      username: string
+      full_name: string
+      avatar_storage_path?: string | null
+      avatar_updated_at?: string | null
+      app_role?: string | null
+    }>
+  ).filter((p) => p.app_role !== 'admin')
 }
 
 async function mapProfilesWithAvatars(
@@ -68,48 +83,114 @@ async function mapProfilesWithAvatars(
     id: p.id,
     username: p.username,
     full_name: p.full_name,
-    avatarUrl: p.avatar_storage_path ? urlMap.get(p.avatar_storage_path) ?? null : null,
+    avatarUrl: p.avatar_storage_path ? (urlMap.get(p.avatar_storage_path) ?? null) : null,
     avatarUpdatedAt: p.avatar_updated_at ?? null,
     tags: (tagsMap.get(p.id) ?? []) as UserTagDto[],
   }))
 }
 
 export async function friendRoutes(app: FastifyInstance) {
-  /** Legacy full list (kept for simple clients). */
-  app.get('/friends', { preHandler: requireAuth }, async (request, reply) => {
-    const { data: rows, error } = await supabaseAdmin
-      .from('friend_requests')
-      .select('id, requester_id, addressee_id, status, created_at, responded_at')
-      .or(`requester_id.eq.${request.userId},addressee_id.eq.${request.userId}`)
-      .order('created_at', { ascending: false })
-
-    if (error) {
-      request.log.error(error)
-      return reply.code(500).send({ error: 'Could not load friends' })
-    }
-
-    const otherIds = new Set<string>()
-    for (const r of rows ?? []) {
-      otherIds.add(r.requester_id === request.userId ? r.addressee_id : r.requester_id)
-    }
-
-    const profiles = await loadPublicProfilesByIds([...otherIds])
-
-    const mapped = await mapProfilesWithAvatars(profiles)
-    const byId = new Map(mapped.map((p) => [p.id, p]))
-
-    return (rows ?? []).map((r) => {
-      const otherId = r.requester_id === request.userId ? r.addressee_id : r.requester_id
-      return {
-        id: r.id,
-        status: r.status,
-        created_at: r.created_at,
-        responded_at: r.responded_at,
-        direction: r.requester_id === request.userId ? 'outgoing' : 'incoming',
-        otherUser: byId.get(otherId) ?? null,
+  /** Accepted friends are bounded; cursor and user filter avoid loading the entire social graph. */
+  app.get<{ Querystring: { limit?: string; cursor?: string; q?: string } }>(
+    '/friends',
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const limit = Math.max(1, Math.min(50, Number(request.query.limit) || 20))
+      let cursor
+      try {
+        cursor = decodePageCursor(request.query.cursor)
+      } catch {
+        return reply.code(400).send({ error: 'Invalid cursor' })
       }
-    })
-  })
+      let query = supabaseAdmin
+        .from('friend_requests')
+        .select('id, requester_id, addressee_id, status, created_at, responded_at')
+        .or(`requester_id.eq.${request.userId},addressee_id.eq.${request.userId}`)
+        .eq('status', 'accepted')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(limit + 1)
+      if (cursor?.id)
+        query = query.or(
+          `created_at.lt.${cursor.date},and(created_at.eq.${cursor.date},id.lt.${cursor.id})`,
+        )
+      else if (cursor) query = query.lt('created_at', cursor.date)
+      const q = (request.query.q ?? '').trim().replace(/^@+/, '')
+      if (q.length > 80)
+        return reply.code(400).send({ error: 'Query must be at most 80 characters' })
+      const initial = q ? null : await query
+      let found = initial?.data ?? []
+      let error = initial?.error ?? null
+      if (q) {
+        const safe = q.replace(/[^\p{L}\p{N} _-]/gu, '').replace(/_/g, '')
+        const searchSide = (
+          self: 'requester_id' | 'addressee_id',
+          other: 'requester_id' | 'addressee_id',
+        ) => {
+          let side = supabaseAdmin
+            .from('friend_requests')
+            .select(
+              `id, requester_id, addressee_id, status, created_at, responded_at, person:profiles!${other}!inner(id, username, full_name)`,
+            )
+            .eq(self, request.userId)
+            .eq('status', 'accepted')
+            .or(`username.ilike.%${safe}%,full_name.ilike.%${safe}%`, {
+              referencedTable: 'person',
+            })
+            .order('created_at', { ascending: false })
+            .order('id', { ascending: false })
+            .limit(limit + 1)
+          if (cursor?.id)
+            side = side.or(
+              `created_at.lt.${cursor.date},and(created_at.eq.${cursor.date},id.lt.${cursor.id})`,
+            )
+          else if (cursor) side = side.lt('created_at', cursor.date)
+          return side
+        }
+        const [sent, received] = await Promise.all([
+          searchSide('requester_id', 'addressee_id'),
+          searchSide('addressee_id', 'requester_id'),
+        ])
+        error = sent.error ?? received.error
+        found = [...(sent.data ?? []), ...(received.data ?? [])]
+          .sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id))
+          .slice(0, limit + 1)
+      }
+      const rows = (found ?? []).slice(0, limit)
+      const nextCursor =
+        (found?.length ?? 0) > limit && rows.length
+          ? encodePageCursor(rows[rows.length - 1]!)
+          : null
+
+      if (error) {
+        request.log.error(error)
+        return reply.code(500).send({ error: 'Could not load friends' })
+      }
+
+      const otherIds = new Set<string>()
+      for (const r of rows ?? []) {
+        otherIds.add(r.requester_id === request.userId ? r.addressee_id : r.requester_id)
+      }
+
+      const profiles = await loadPublicProfilesByIds([...otherIds])
+
+      const mapped = await mapProfilesWithAvatars(profiles)
+      const byId = new Map(mapped.map((p) => [p.id, p]))
+
+      const items = (rows ?? []).map((r) => {
+        const otherId = r.requester_id === request.userId ? r.addressee_id : r.requester_id
+        return {
+          id: r.id,
+          status: r.status,
+          created_at: r.created_at,
+          responded_at: r.responded_at,
+          direction: r.requester_id === request.userId ? 'outgoing' : 'incoming',
+          otherUser: byId.get(otherId) ?? null,
+        }
+      })
+      return collectionResponse(request, reply, 'friends', items, nextCursor)
+    },
+  )
 
   app.get('/friends/requests/count', { preHandler: requireAuth }, async (request, reply) => {
     const { count, error } = await supabaseAdmin
@@ -126,65 +207,85 @@ export async function friendRoutes(app: FastifyInstance) {
     return { count: count ?? 0 }
   })
 
-  app.get<{ Querystring: { direction?: string; limit?: string; cursor?: string } }>(
-    '/friends/requests',
-    { preHandler: requireAuth },
-    async (request, reply) => {
-      const direction = request.query.direction === 'outgoing' ? 'outgoing' : 'incoming'
-      const limit = Math.min(Number(request.query.limit ?? 20) || 20, 50)
-      const cursor = request.query.cursor?.trim()
+  app.get<{
+    Querystring: { direction?: string; limit?: string; cursor?: string; q?: string }
+  }>('/friends/requests', { preHandler: requireAuth }, async (request, reply) => {
+    const direction = request.query.direction === 'outgoing' ? 'outgoing' : 'incoming'
+    const limit = Math.max(1, Math.min(Number(request.query.limit ?? 20) || 20, 50))
+    let cursor
+    try {
+      cursor = decodePageCursor(request.query.cursor)
+    } catch {
+      return reply.code(400).send({ error: 'Invalid cursor' })
+    }
 
-      let query = supabaseAdmin
-        .from('friend_requests')
-        .select('id, requester_id, addressee_id, status, created_at, responded_at')
-        .eq('status', 'pending')
-        .order('created_at', { ascending: false })
-        .limit(limit + 1)
-
-      if (direction === 'incoming') {
-        query = query.eq('addressee_id', request.userId)
-      } else {
-        query = query.eq('requester_id', request.userId)
-      }
-
-      if (cursor) {
-        query = query.lt('created_at', cursor)
-      }
-
-      const { data: rows, error } = await query
-      if (error) {
-        request.log.error(error)
-        return reply.code(500).send({ error: 'Could not load requests' })
-      }
-
-      const page = (rows ?? []).slice(0, limit)
-      const nextCursor =
-        (rows ?? []).length > limit ? page[page.length - 1]?.created_at ?? null : null
-
-      const otherIds = page.map((r) =>
-        r.requester_id === request.userId ? r.addressee_id : r.requester_id,
+    const q = (request.query.q ?? '').trim().replace(/^@+/, '')
+    if (q.length > 80) return reply.code(400).send({ error: 'Query must be at most 80 characters' })
+    const other = direction === 'incoming' ? 'requester_id' : 'addressee_id'
+    let query = supabaseAdmin
+      .from('friend_requests')
+      .select(
+        `id, requester_id, addressee_id, status, created_at, responded_at${q ? `, person:profiles!${other}!inner(id, username, full_name)` : ''}`,
       )
-      const profiles = await loadPublicProfilesByIds(otherIds)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(limit + 1)
 
-      const mapped = await mapProfilesWithAvatars(profiles)
-      const byId = new Map(mapped.map((p) => [p.id, p]))
+    if (direction === 'incoming') {
+      query = query.eq('addressee_id', request.userId)
+    } else {
+      query = query.eq('requester_id', request.userId)
+    }
 
+    if (cursor?.id)
+      query = query.or(
+        `created_at.lt.${cursor.date},and(created_at.eq.${cursor.date},id.lt.${cursor.id})`,
+      )
+    else if (cursor) query = query.lt('created_at', cursor.date)
+
+    if (q) {
+      const safe = q.replace(/[^\p{L}\p{N} _-]/gu, '').replace(/_/g, '')
+      query = query.or(`username.ilike.%${safe}%,full_name.ilike.%${safe}%`, {
+        referencedTable: 'person',
+      })
+    }
+
+    const { data: rows, error } = await query.returns<FriendRequestRecord[]>()
+    if (error) {
+      request.log.error(error)
+      return reply.code(500).send({ error: 'Could not load requests' })
+    }
+
+    const page = (rows ?? []).slice(0, limit)
+    const nextCursor =
+      (rows ?? []).length > limit
+        ? page.length
+          ? encodePageCursor(page[page.length - 1]!)
+          : null
+        : null
+
+    const otherIds = page.map((r) =>
+      r.requester_id === request.userId ? r.addressee_id : r.requester_id,
+    )
+    const profiles = await loadPublicProfilesByIds(otherIds)
+
+    const mapped = await mapProfilesWithAvatars(profiles)
+    const byId = new Map(mapped.map((p) => [p.id, p]))
+
+    const items = page.map((r) => {
+      const otherId = r.requester_id === request.userId ? r.addressee_id : r.requester_id
       return {
-        requests: page.map((r) => {
-          const otherId = r.requester_id === request.userId ? r.addressee_id : r.requester_id
-          return {
-            id: r.id,
-            status: r.status,
-            created_at: r.created_at,
-            responded_at: r.responded_at,
-            direction,
-            otherUser: byId.get(otherId) ?? null,
-          }
-        }),
-        nextCursor,
+        id: r.id,
+        status: r.status,
+        created_at: r.created_at,
+        responded_at: r.responded_at,
+        direction,
+        otherUser: byId.get(otherId) ?? null,
       }
-    },
-  )
+    })
+    return collectionResponse(request, reply, 'requests', items, nextCursor)
+  })
 
   app.get<{ Querystring: { limit?: string; cursor?: string } }>(
     '/friends/recommendations',
@@ -253,7 +354,7 @@ export async function friendRoutes(app: FastifyInstance) {
         sliced = ids.filter((id) => id > cursor)
       }
       const pageIds = sliced.slice(0, limit)
-      const nextCursor = sliced.length > limit ? pageIds[pageIds.length - 1] ?? null : null
+      const nextCursor = sliced.length > limit ? (pageIds[pageIds.length - 1] ?? null) : null
 
       if (pageIds.length === 0) {
         return { users: [], nextCursor: null }
@@ -264,10 +365,13 @@ export async function friendRoutes(app: FastifyInstance) {
       const mapped = await mapProfilesWithAvatars(profiles)
       mapped.sort((a, b) => a.id.localeCompare(b.id))
 
-      return {
-        users: mapped.map((u) => ({ ...u, friendshipStatus: 'none' as const })),
+      return collectionResponse(
+        request,
+        reply,
+        'users',
+        mapped.map((u) => ({ ...u, friendshipStatus: 'none' as const })),
         nextCursor,
-      }
+      )
     },
   )
 
@@ -382,10 +486,7 @@ export async function friendRoutes(app: FastifyInstance) {
         return reply.code(500).send({ error: 'Could not accept request' })
       }
 
-      const conversationId = await findOrCreateDirectConversation(
-        fr.requester_id,
-        fr.addressee_id,
-      )
+      const conversationId = await findOrCreateDirectConversation(fr.requester_id, fr.addressee_id)
       await sendFriendWelcomeMessages(conversationId, fr.requester_id, fr.addressee_id)
 
       return { conversationId, requestId: fr.id }
