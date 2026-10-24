@@ -321,7 +321,7 @@ export async function communityRoutes(app: FastifyInstance) {
   })
 
   /** GET /communities — joined list */
-  app.get('/communities', { preHandler: requireAuth }, async (request, reply) => {
+  app.get<{ Querystring: { limit?: string; cursor?: string; q?: string } }>('/communities', { preHandler: requireAuth }, async (request, reply) => {
     const { data: memberships, error } = await supabaseAdmin
       .from('community_members')
       .select('community_id, status')
@@ -331,7 +331,7 @@ export async function communityRoutes(app: FastifyInstance) {
       request.log.error(error)
       return reply.code(500).send({ error: 'Could not load communities' })
     }
-    if (!memberships?.length) return { communities: [] }
+    if (!memberships?.length) return { communities: [], catalogIds: [], nextCursor: null }
 
     const ids = memberships.map((m) => m.community_id as string)
     const { data: rows, error: cErr } = await supabaseAdmin
@@ -366,7 +366,19 @@ export async function communityRoutes(app: FastifyInstance) {
         })
       }),
     )
-    return { communities: communities.filter((c) => c != null) }
+    const visible = communities.filter(c => c != null).sort((a,b) => a.id.localeCompare(b.id))
+    // Old app builds omit limit and retain their complete-catalog contract.
+    if (!request.query.limit) return { communities: visible }
+    const limit = Number(request.query.limit)
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) return reply.code(400).send({ error: 'Invalid limit' })
+    const cursor = request.query.cursor
+    if (cursor && !/^[0-9a-f-]{36}$/i.test(cursor)) return reply.code(400).send({ error: 'Invalid cursor' })
+    const q = (request.query.q ?? '').trim().toLowerCase().replace(/^&+/, '')
+    if (q.length > TEXT_LIMITS.search) return reply.code(400).send({ error: 'Search too long' })
+    const matches = q ? visible.filter(c => c.name.toLowerCase().includes(q) || c.identifier.toLowerCase().includes(q)) : visible
+    const remaining = cursor ? matches.filter(c => c.id > cursor) : matches
+    const page = remaining.slice(0, limit)
+    return { communities: page, catalogIds: visible.map(c => c.id), nextCursor: remaining.length > limit ? page.at(-1)!.id : null }
   })
 
   /** GET /communities/search?q= */

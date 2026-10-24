@@ -23,7 +23,11 @@ import { reportRoutes } from './routes/reports.js'
 import { adminRoutes } from './routes/admin.js'
 import { forwardHttpRequest } from './lib/forwardHttpRequest.js'
 
+import { installResourceResponses } from './lib/resourceResponse.js'
+
 const app = Fastify({ logger: true })
+
+installResourceResponses(app)
 
 await app.register(helmet, {
   crossOriginResourcePolicy: { policy: 'cross-origin' },
@@ -37,6 +41,8 @@ await app.register(cors, {
     'x-job-secret',
     'If-None-Match',
     'x-peerpool-revisions',
+    'x-peerpool-resource',
+    'x-peerpool-known',
   ],
   exposedHeaders: ['ETag'],
 })

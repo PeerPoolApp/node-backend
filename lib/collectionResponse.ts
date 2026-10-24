@@ -7,7 +7,7 @@ export function rowRevision(value: unknown): string {
   return createHash('sha256')
     .update(
       JSON.stringify(value, (key, item) =>
-        /(?:avatarUrl|coverUrl|downloadUrl)$/.test(key) ? undefined : item,
+        /(?:avatar_?url|cover_?url|download_?url)$/i.test(key) ? undefined : item,
       ),
     )
     .digest('hex')

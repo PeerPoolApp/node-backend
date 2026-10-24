@@ -1007,21 +1007,24 @@ async function queryAgendaRows(
   from: string,
   to: string,
   kind: AgendaKind,
-): Promise<{ rows: EventRow[] } | { error: string; status: number }> {
+  offset = 0,
+  instants?: { from: string; to: string },
+): Promise<{ rows: EventRow[]; nextCursor: string | null } | { error: string; status: number }> {
   let orFilter: string
   try {
     orFilter = await visibleEventsOrFilter(userId)
   } catch {
     return { error: 'Could not load agenda', status: 500 }
   }
-  const rangeStart = new Date(`${from}T00:00:00`)
-  const rangeEnd = new Date(`${to}T23:59:59.999`)
+  const rangeStart = new Date(instants?.from ?? `${from}T00:00:00`)
+  const rangeEnd = new Date(instants?.to ?? `${to}T23:59:59.999`)
   const { data: rows, error } = await eventSelect()
     .or(orFilter)
     .lt('starts_at', rangeEnd.toISOString())
     .gt('ends_at', rangeStart.toISOString())
     .order('starts_at', { ascending: true })
-    .limit(200)
+    .order('id', { ascending: true })
+    .range(offset, offset + 199)
   if (error) return { error: 'Could not load agenda', status: 500 }
   const hides = await hiddenIdsFor(userId, 'event')
   const visible: EventRow[] = []
@@ -1029,7 +1032,7 @@ async function queryAgendaRows(
     if (await eventAllowedForViewer(row, userId, hides)) visible.push(row)
   }
   const filtered = visible.filter((row) => rowMatchesAgendaKind(row, kind))
-  return { rows: filtered }
+  return { rows: filtered, nextCursor: rows?.length === 200 ? String(offset + 200) : null }
 }
 
 export async function eventRoutes(app: FastifyInstance) {
@@ -1110,9 +1113,9 @@ export async function eventRoutes(app: FastifyInstance) {
   )
 
   /**
-   * GET `/events/agenda` — events in a date window for MyTime calendar (no cursor).
+   * GET `/events/agenda` — events in a bounded date window for MyTime; 200-row continuation pages.
    */
-  app.get<{ Querystring: { from?: string; to?: string; kind?: string } }>(
+  app.get<{ Querystring: { from?: string; to?: string; kind?: string; cursor?: string; fromInstant?: string; toInstant?: string } }>(
     '/events/agenda',
     { preHandler: requireAuth },
     async (request, reply) => {
@@ -1125,11 +1128,22 @@ export async function eventRoutes(app: FastifyInstance) {
       if (from > to) return reply.code(400).send({ error: 'from must be on or before to' })
       if (!kind) return reply.code(400).send({ error: 'Invalid kind' })
 
-      const listed = await queryAgendaRows(request.userId, from, to, kind)
+      const offset = Number(request.query.cursor ?? '0')
+      if (!Number.isSafeInteger(offset) || offset < 0 || (request.query.cursor && !/^\d+$/.test(request.query.cursor))) return reply.code(400).send({ error: 'Invalid cursor' })
+      if (Date.parse(to) - Date.parse(from) > 93 * 86400000) return reply.code(400).send({ error: 'Agenda range exceeds 93 days' })
+      let instants: { from: string; to: string } | undefined
+      if (request.query.fromInstant || request.query.toInstant) {
+        const start = Date.parse(request.query.fromInstant ?? ''), end = Date.parse(request.query.toInstant ?? '')
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end || end - start > 94 * 86400000
+          || Math.abs(start - Date.parse(from)) > 86400000 || Math.abs(end - Date.parse(to)) > 2 * 86400000)
+          return reply.code(400).send({ error: 'Invalid agenda instants' })
+        instants = { from: new Date(start).toISOString(), to: new Date(end).toISOString() }
+      }
+      const listed = await queryAgendaRows(request.userId, from, to, kind, offset, instants)
       if ('error' in listed) return reply.code(listed.status).send({ error: listed.error })
 
       const events = await toDtoPage(listed.rows, request.userId)
-      return { events }
+      return { events, nextCursor: listed.nextCursor }
     },
   )
 
